@@ -33,6 +33,10 @@ if (isset($_GET['logout'])) {
     exit;
 }
 
+// 🔑 QUAN TRỌNG: Đóng Session ngay để tránh PHP Session Locking làm treo request AJAX
+$csrfToken = $_SESSION['csrf_token'] ?? '';
+session_write_close();
+
 // 2. BLOCK AJAX REQUEST IF UNAUTHENTICATED OR INVALID CSRF TOKEN
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WITH'])) {
     header('Content-Type: application/json');
@@ -45,7 +49,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
 
     // CSRF Protection Check
     $clientCsrf = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
-    if (empty($_SESSION['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $clientCsrf)) {
+    if (empty($csrfToken) || !hash_equals($csrfToken, $clientCsrf)) {
         http_response_code(403);
         echo json_encode(['status' => 'error', 'message' => 'SECURITY ERROR: Invalid CSRF Token!']);
         exit;
@@ -69,7 +73,6 @@ function queryMpvStatus() {
     $result = ['time_pos' => 0, 'duration' => 0, 'paused' => false, 'volume' => 100, 'title' => 'Loading...'];
     if (!file_exists($socketFile)) return $result;
 
-    // Timeout ngắn 0.1s để không treo Web khi MPV đơ
     $socket = @stream_socket_client("unix://$socketFile", $errno, $errstr, 0.1);
     if (!$socket) return $result;
 
@@ -112,7 +115,7 @@ function sendSingleIpc($command) {
     return json_decode($res, true);
 }
 
-// 3. API ENDPOINTS (Protected via Auth & CSRF)
+// 3. API ENDPOINTS
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WITH'])) {
     $action = $_POST['action'] ?? '';
     $ephemeralSudoPass = $_POST['sudo_pass'] ?? '';
@@ -553,9 +556,10 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
 </div>
 
 <script>
-const CSRF_TOKEN = "<?php echo $_SESSION['csrf_token'] ?? ''; ?>";
-let isCheckingStatus = false;
+const CSRF_TOKEN = "<?php echo $csrfToken; ?>";
+let statusAbortController = null;
 let statusTimer = null;
+let lastCheckTime = Date.now();
 
 function formatTime(secs) {
     if (!secs || isNaN(secs) || secs < 0) return "00:00";
@@ -563,20 +567,6 @@ function formatTime(secs) {
     const m = Math.floor(totalSecs / 60);
     const s = totalSecs % 60;
     return (m < 10 ? "0" + m : m) + ":" + (s < 10 ? "0" + s : s);
-}
-
-// Fetch helper bọc AbortController chống treo UI
-async function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const response = await fetch(url, { ...options, signal: controller.signal });
-        clearTimeout(id);
-        return response;
-    } catch (err) {
-        clearTimeout(id);
-        throw err;
-    }
 }
 
 async function sendAction(actionName, extraData = {}) {
@@ -594,15 +584,26 @@ async function sendAction(actionName, extraData = {}) {
     const alertBox = document.getElementById('alertBox');
     const termOutput = document.getElementById('termOutput');
 
+    // Hủy request poll status đang chạy dở để ưu tiên gửi action ngay
+    if (statusAbortController) {
+        statusAbortController.abort();
+        statusAbortController = null;
+    }
+
+    const actionController = new AbortController();
+    const actionTimeout = setTimeout(() => actionController.abort(), 8000);
+
     try {
-        const res = await fetchWithTimeout(window.location.href, {
+        const res = await fetch(window.location.href, {
             method: 'POST',
             headers: {
                 'X-Requested-With': 'XMLHttpRequest',
                 'X-CSRF-Token': CSRF_TOKEN
             },
-            body: formData
-        }, 8000); // Cho action 8s timeout
+            body: formData,
+            signal: actionController.signal
+        });
+        clearTimeout(actionTimeout);
 
         if (res.status === 401 || res.status === 403) {
             window.location.reload();
@@ -622,9 +623,11 @@ async function sendAction(actionName, extraData = {}) {
 
         triggerStatusCheckNow();
     } catch (err) {
+        clearTimeout(actionTimeout);
         alertBox.style.display = 'block';
         alertBox.className = 'alert error';
-        alertBox.textContent = err.name === 'AbortError' ? 'Request Timeout!' : 'Server connection error or invalid CSRF token!';
+        alertBox.textContent = err.name === 'AbortError' ? 'Action Timeout!' : 'Server connection error!';
+        triggerStatusCheckNow();
     }
 }
 
@@ -642,19 +645,19 @@ async function uploadCookieFile() {
     formData.append('cookie_file', fileInput.files[0]);
 
     try {
-        const res = await fetchWithTimeout(window.location.href, {
+        const res = await fetch(window.location.href, {
             method: 'POST',
             headers: {
                 'X-Requested-With': 'XMLHttpRequest',
                 'X-CSRF-Token': CSRF_TOKEN
             },
             body: formData
-        }, 5000);
+        });
         const data = await res.json();
         alert(data.message);
         triggerStatusCheckNow();
     } catch(e) {
-        alert("Upload failed or timed out.");
+        alert("Upload failed.");
     }
 }
 
@@ -662,22 +665,32 @@ document.getElementById('ytUrl').addEventListener('keypress', (e) => { if (e.key
 document.getElementById('shellCmd').addEventListener('keypress', (e) => { if (e.key === 'Enter') sendAction('run_cmd'); });
 
 async function checkStatus() {
-    // Chống trùng lặp request khi request trước chưa trả về
-    if (isCheckingStatus) return;
-    isCheckingStatus = true;
+    lastCheckTime = Date.now();
+
+    // Nếu đang có request poll cũ chưa trả về -> HỦY BỎ REQUEST CŨ NGAY
+    if (statusAbortController) {
+        statusAbortController.abort();
+    }
+
+    statusAbortController = new AbortController();
+    const timeoutId = setTimeout(() => {
+        if (statusAbortController) statusAbortController.abort();
+    }, 2500); // Poll status timeout 2.5s ép hủy
 
     try {
         const formData = new FormData();
         formData.append('action', 'get_status');
 
-        const res = await fetchWithTimeout(window.location.href, {
+        const res = await fetch(window.location.href, {
             method: 'POST',
             headers: {
                 'X-Requested-With': 'XMLHttpRequest',
                 'X-CSRF-Token': CSRF_TOKEN
             },
-            body: formData
-        }, 3000); // 3s timeout cho status check
+            body: formData,
+            signal: statusAbortController.signal
+        });
+        clearTimeout(timeoutId);
 
         if (res.status === 401 || res.status === 403) {
             window.location.reload();
@@ -734,10 +747,9 @@ async function checkStatus() {
             }
         }
     } catch(e) {
-        // Bỏ qua lỗi timeout/fetch khi màn hình tắt hoặc chập chờn
+        // Bỏ qua AbortError khi sleep/switch tab
     } finally {
-        isCheckingStatus = false;
-        // Schedule lần chạy tiếp theo CHỈ KHI request hiện tại đã xử lý xong
+        statusAbortController = null;
         scheduleNextStatusCheck(1500);
     }
 }
@@ -749,14 +761,24 @@ function scheduleNextStatusCheck(delay = 1500) {
 
 function triggerStatusCheckNow() {
     if (statusTimer) clearTimeout(statusTimer);
-    isCheckingStatus = false;
+    if (statusAbortController) {
+        statusAbortController.abort();
+        statusAbortController = null;
+    }
     checkStatus();
 }
 
-// Bắt đầu vòng lặp polling an toàn
-scheduleNextStatusCheck(500);
+// WATCHDOG TIMER: Tự động hồi sinh nếu sau 4.5s mà không thấy poll chạy (Chống đơ khi wake up)
+setInterval(() => {
+    if (Date.now() - lastCheckTime > 4500) {
+        triggerStatusCheckNow();
+    }
+}, 2000);
 
-// Khi bật lại màn hình hoặc active lại tab: Reset state & check ngay lập tức
+// Bắt đầu chạy
+scheduleNextStatusCheck(300);
+
+// Khi bật lại màn hình hoặc active lại tab -> Khôi phục tức thì
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
         triggerStatusCheckNow();
