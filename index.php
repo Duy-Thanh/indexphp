@@ -69,10 +69,11 @@ function queryMpvStatus() {
     $result = ['time_pos' => 0, 'duration' => 0, 'paused' => false, 'volume' => 100, 'title' => 'Loading...'];
     if (!file_exists($socketFile)) return $result;
 
-    $socket = @stream_socket_client("unix://$socketFile", $errno, $errstr, 0.5);
+    // Timeout ngắn 0.1s để không treo Web khi MPV đơ
+    $socket = @stream_socket_client("unix://$socketFile", $errno, $errstr, 0.1);
     if (!$socket) return $result;
 
-    stream_set_timeout($socket, 0, 500000);
+    stream_set_timeout($socket, 0, 100000); // 100ms max timeout per read
     $cmds = [
         json_encode(['command' => ['get_property', 'time-pos']]),
         json_encode(['command' => ['get_property', 'duration']]),
@@ -101,9 +102,10 @@ function queryMpvStatus() {
 function sendSingleIpc($command) {
     global $socketFile;
     if (!file_exists($socketFile)) return false;
-    $socket = @stream_socket_client("unix://$socketFile", $errno, $errstr, 0.5);
+    $socket = @stream_socket_client("unix://$socketFile", $errno, $errstr, 0.1);
     if (!$socket) return false;
 
+    stream_set_timeout($socket, 0, 100000);
     @fwrite($socket, json_encode(['command' => $command]) . "\n");
     $res = @fgets($socket);
     @fclose($socket);
@@ -113,7 +115,6 @@ function sendSingleIpc($command) {
 // 3. API ENDPOINTS (Protected via Auth & CSRF)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WITH'])) {
     $action = $_POST['action'] ?? '';
-    // Sudo password exists ONLY IN RAM for this request - Never saved to session disk
     $ephemeralSudoPass = $_POST['sudo_pass'] ?? '';
 
     $response = ['status' => 'error', 'message' => 'Invalid action!'];
@@ -235,13 +236,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
 
             file_put_contents($logFile, "=== MPV SESSION LAUNCHED: " . date('Y-m-d H:i:s') . " ===\nURL: $raw_url\n\n");
 
-            $pulseServer = getenv('PULSE_SERVER') ?: trim(shell_exec("echo \$PULSE_SERVER"));
-            $xdgDir = getenv('XDG_RUNTIME_DIR') ?: trim(shell_exec("echo \$XDG_RUNTIME_DIR"));
-
-            $envPrefix = "";
-            if (!empty($pulseServer)) $envPrefix .= "PULSE_SERVER=" . escapeshellarg($pulseServer) . " ";
-            if (!empty($xdgDir)) $envPrefix .= "XDG_RUNTIME_DIR=" . escapeshellarg($xdgDir) . " ";
-
             $mpvCmd = "env PULSE_SERVER='unix:/tmp/.pulse-socket' XDG_RUNTIME_DIR='/run/user/0' mpv --no-video "
                     . "--force-seekable=yes "
                     . "--cache=yes "
@@ -261,7 +255,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
 
             $mpvCmd .= " --ytdl-raw-options=" . escapeshellarg(implode(',', $rawOpts));
 
-            // Ghép thẳng: PULSE_SERVER=xxx XDG_RUNTIME_DIR=yyy nohup setsid mpv ...
             exec("nohup setsid $mpvCmd " . $escaped_url . " > " . escapeshellarg($logFile) . " 2>&1 &");
             $response = ['status' => 'success', 'message' => 'Playback started!'];
         } else {
@@ -561,6 +554,8 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
 
 <script>
 const CSRF_TOKEN = "<?php echo $_SESSION['csrf_token'] ?? ''; ?>";
+let isCheckingStatus = false;
+let statusTimer = null;
 
 function formatTime(secs) {
     if (!secs || isNaN(secs) || secs < 0) return "00:00";
@@ -568,6 +563,20 @@ function formatTime(secs) {
     const m = Math.floor(totalSecs / 60);
     const s = totalSecs % 60;
     return (m < 10 ? "0" + m : m) + ":" + (s < 10 ? "0" + s : s);
+}
+
+// Fetch helper bọc AbortController chống treo UI
+async function fetchWithTimeout(url, options = {}, timeoutMs = 3500) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(id);
+        return response;
+    } catch (err) {
+        clearTimeout(id);
+        throw err;
+    }
 }
 
 async function sendAction(actionName, extraData = {}) {
@@ -586,14 +595,14 @@ async function sendAction(actionName, extraData = {}) {
     const termOutput = document.getElementById('termOutput');
 
     try {
-        const res = await fetch(window.location.href, {
+        const res = await fetchWithTimeout(window.location.href, {
             method: 'POST',
             headers: {
                 'X-Requested-With': 'XMLHttpRequest',
                 'X-CSRF-Token': CSRF_TOKEN
             },
             body: formData
-        });
+        }, 8000); // Cho action 8s timeout
 
         if (res.status === 401 || res.status === 403) {
             window.location.reload();
@@ -611,11 +620,11 @@ async function sendAction(actionName, extraData = {}) {
             alertBox.textContent = data.message;
         }
 
-        checkStatus();
+        triggerStatusCheckNow();
     } catch (err) {
         alertBox.style.display = 'block';
         alertBox.className = 'alert error';
-        alertBox.textContent = 'Server connection error or invalid CSRF token!';
+        alertBox.textContent = err.name === 'AbortError' ? 'Request Timeout!' : 'Server connection error or invalid CSRF token!';
     }
 }
 
@@ -632,34 +641,49 @@ async function uploadCookieFile() {
     formData.append('action', 'upload_cookies');
     formData.append('cookie_file', fileInput.files[0]);
 
-    const res = await fetch(window.location.href, {
-        method: 'POST',
-        headers: {
-            'X-Requested-With': 'XMLHttpRequest',
-            'X-CSRF-Token': CSRF_TOKEN
-        },
-        body: formData
-    });
-    const data = await res.json();
-    alert(data.message);
-    checkStatus();
-}
-
-document.getElementById('ytUrl').addEventListener('keypress', (e) => { if (e.key === 'Enter') sendAction('play'); });
-document.getElementById('shellCmd').addEventListener('keypress', (e) => { if (e.key === 'Enter') sendAction('run_cmd'); });
-
-async function checkStatus() {
     try {
-        const formData = new FormData();
-        formData.append('action', 'get_status');
-        const res = await fetch(window.location.href, {
+        const res = await fetchWithTimeout(window.location.href, {
             method: 'POST',
             headers: {
                 'X-Requested-With': 'XMLHttpRequest',
                 'X-CSRF-Token': CSRF_TOKEN
             },
             body: formData
-        });
+        }, 5000);
+        const data = await res.json();
+        alert(data.message);
+        triggerStatusCheckNow();
+    } catch(e) {
+        alert("Upload failed or timed out.");
+    }
+}
+
+document.getElementById('ytUrl').addEventListener('keypress', (e) => { if (e.key === 'Enter') sendAction('play'); });
+document.getElementById('shellCmd').addEventListener('keypress', (e) => { if (e.key === 'Enter') sendAction('run_cmd'); });
+
+async function checkStatus() {
+    // Chống trùng lặp request khi request trước chưa trả về
+    if (isCheckingStatus) return;
+    isCheckingStatus = true;
+
+    try {
+        const formData = new FormData();
+        formData.append('action', 'get_status');
+
+        const res = await fetchWithTimeout(window.location.href, {
+            method: 'POST',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-Token': CSRF_TOKEN
+            },
+            body: formData
+        }, 3000); // 3s timeout cho status check
+
+        if (res.status === 401 || res.status === 403) {
+            window.location.reload();
+            return;
+        }
+
         const data = await res.json();
 
         const procSection = document.getElementById('procSection');
@@ -709,19 +733,38 @@ async function checkStatus() {
                 mpvLogBox.scrollTop = mpvLogBox.scrollHeight;
             }
         }
-    } catch(e) {}
+    } catch(e) {
+        // Bỏ qua lỗi timeout/fetch khi màn hình tắt hoặc chập chờn
+    } finally {
+        isCheckingStatus = false;
+        // Schedule lần chạy tiếp theo CHỈ KHI request hiện tại đã xử lý xong
+        scheduleNextStatusCheck(1500);
+    }
 }
-setInterval(checkStatus, 1200);
 
-// Tự động fetch lại status ngay lập tức khi bật lại màn hình / active tab
+function scheduleNextStatusCheck(delay = 1500) {
+    if (statusTimer) clearTimeout(statusTimer);
+    statusTimer = setTimeout(checkStatus, delay);
+}
+
+function triggerStatusCheckNow() {
+    if (statusTimer) clearTimeout(statusTimer);
+    isCheckingStatus = false;
+    checkStatus();
+}
+
+// Bắt đầu vòng lặp polling an toàn
+scheduleNextStatusCheck(500);
+
+// Khi bật lại màn hình hoặc active lại tab: Reset state & check ngay lập tức
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
-        checkStatus();
+        triggerStatusCheckNow();
     }
 });
 
 window.addEventListener('focus', () => {
-    checkStatus();
+    triggerStatusCheckNow();
 });
 </script>
 <?php endif; ?>
