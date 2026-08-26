@@ -235,17 +235,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
 
             file_put_contents($logFile, "=== MPV SESSION LAUNCHED: " . date('Y-m-d H:i:s') . " ===\nURL: $raw_url\n\n");
 
-            // Lấy giá trị PULSE_SERVER và XDG_RUNTIME_DIR hiện tại
             $pulseServer = getenv('PULSE_SERVER') ?: trim(shell_exec("echo \$PULSE_SERVER"));
             $xdgDir = getenv('XDG_RUNTIME_DIR') ?: trim(shell_exec("echo \$XDG_RUNTIME_DIR"));
 
-            // Tạo chuỗi env inline
-            $envInline = "";
-            if (!empty($pulseServer)) $envInline .= "PULSE_SERVER=" . escapeshellarg($pulseServer) . " ";
-            if (!empty($xdgDir)) $envInline .= "XDG_RUNTIME_DIR=" . escapeshellarg($xdgDir) . " ";
+            $envPrefix = "";
+            if (!empty($pulseServer)) $envPrefix .= "PULSE_SERVER=" . escapeshellarg($pulseServer) . " ";
+            if (!empty($xdgDir)) $envPrefix .= "XDG_RUNTIME_DIR=" . escapeshellarg($xdgDir) . " ";
 
-            // Lệnh MPV gốc của mày
-            $mpvCmd = "mpv --no-video "
+            $mpvCmd = $envPrefix . "mpv --no-video "
                     . "--force-seekable=yes "
                     . "--cache=yes "
                     . "--demuxer-max-bytes=100M "
@@ -265,9 +262,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
             $mpvCmd .= " --ytdl-raw-options=" . escapeshellarg(implode(',', $rawOpts));
 
             // Ghép thẳng: PULSE_SERVER=xxx XDG_RUNTIME_DIR=yyy nohup setsid mpv ...
-            $fullCmd = "nohup setsid {$envInline}{$mpvCmd} {$escaped_url} > " . escapeshellarg($logFile) . " 2>&1 &";
-
-            exec($fullCmd);
+            exec("nohup setsid $mpvCmd " . $escaped_url . " > " . escapeshellarg($logFile) . " 2>&1 &");
             $response = ['status' => 'success', 'message' => 'Playback started!'];
         } else {
             $response = ['status' => 'error', 'message' => 'Invalid YouTube URL!'];
