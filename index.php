@@ -2,29 +2,29 @@
 // =========================================================================
 // SECURITY CONFIGURATION
 // =========================================================================
-define('AUTH_PASSCODE', '123456'); // 🔑 ĐỔI MẬT KHẨU TRUY CẬP Ở ĐÂY
-define('ENABLE_SHELL_TERMINAL', true); // ⚠️ Đặt 'true' nếu CHẮC CHẮN muốn bật RCE Terminal
+define('AUTH_PASSCODE', '123456'); // 🔑 CHANGE ACCESS PASSCODE HERE
+define('ENABLE_SHELL_TERMINAL', true); // ⚠️ Set 'true' ONLY if you want to enable RCE Terminal
 
-// Cấu hình cookie session an toàn
+// Secure session cookie configuration
 ini_set('session.cookie_httponly', 1);
 ini_set('session.use_strict_mode', 1);
 session_start();
 
-// 1. KIỂM TRA XÁC THỰC (AUTHENTICATION)
+// 1. AUTHENTICATION CHECK
 if (isset($_POST['action']) && $_POST['action'] === 'login') {
     header('Content-Type: application/json');
     $pass = $_POST['passcode'] ?? '';
     if (hash_equals(AUTH_PASSCODE, $pass)) {
         $_SESSION['authenticated'] = true;
         $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-        echo json_encode(['status' => 'success', 'message' => 'Đăng nhập thành công!']);
+        echo json_encode(['status' => 'success', 'message' => 'Login successful!']);
     } else {
-        echo json_encode(['status' => 'error', 'message' => 'Mật khẩu truy cập không đúng!']);
+        echo json_encode(['status' => 'error', 'message' => 'Incorrect passcode!']);
     }
     exit;
 }
 
-// Chặn toàn bộ truy cập nếu chưa Auth
+// Block all access if not authenticated
 $isAuthenticated = !empty($_SESSION['authenticated']) && $_SESSION['authenticated'] === true;
 
 if (isset($_GET['logout'])) {
@@ -33,13 +33,13 @@ if (isset($_GET['logout'])) {
     exit;
 }
 
-// 2. CHẶN AJAX REQUEST NẾU CHƯA AUTH HOẶC SAI CSRF TOKEN
+// 2. BLOCK AJAX REQUEST IF UNAUTHENTICATED OR INVALID CSRF TOKEN
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WITH'])) {
     header('Content-Type: application/json');
 
     if (!$isAuthenticated) {
         http_response_code(401);
-        echo json_encode(['status' => 'error', 'message' => 'LỖI BẢO MẬT: Chưa xác thực (Unauthorized)!']);
+        echo json_encode(['status' => 'error', 'message' => 'SECURITY ERROR: Unauthorized!']);
         exit;
     }
 
@@ -47,7 +47,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
     $clientCsrf = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
     if (empty($_SESSION['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $clientCsrf)) {
         http_response_code(403);
-        echo json_encode(['status' => 'error', 'message' => 'LỖI BẢO MẬT: CSRF Token không hợp lệ!']);
+        echo json_encode(['status' => 'error', 'message' => 'SECURITY ERROR: Invalid CSRF Token!']);
         exit;
     }
 }
@@ -66,7 +66,7 @@ putenv("PATH=$binDir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bi
 // Helper Functions
 function queryMpvStatus() {
     global $socketFile;
-    $result = ['time_pos' => 0, 'duration' => 0, 'paused' => false, 'volume' => 100, 'title' => 'Đang tải...'];
+    $result = ['time_pos' => 0, 'duration' => 0, 'paused' => false, 'volume' => 100, 'title' => 'Loading...'];
     if (!file_exists($socketFile)) return $result;
 
     $socket = @stream_socket_client("unix://$socketFile", $errno, $errstr, 0.5);
@@ -110,13 +110,13 @@ function sendSingleIpc($command) {
     return json_decode($res, true);
 }
 
-// 3. API ENDPOINTS (Đã được bảo vệ qua Auth & CSRF)
+// 3. API ENDPOINTS (Protected via Auth & CSRF)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WITH'])) {
     $action = $_POST['action'] ?? '';
-    // Mật khẩu Sudo CHỈ NẰM TRONG RAM REQUEST NÀY - Không bao giờ lưu vào SESSION đĩa nữa
+    // Sudo password exists ONLY IN RAM for this request - Never saved to session disk
     $ephemeralSudoPass = $_POST['sudo_pass'] ?? '';
 
-    $response = ['status' => 'error', 'message' => 'Lệnh không hợp lệ!'];
+    $response = ['status' => 'error', 'message' => 'Invalid action!'];
 
     if ($action === 'update_ytdlp' || $action === 'update_ytdlp_nightly') {
         $ytdlpPath = $binDir . '/yt-dlp';
@@ -135,37 +135,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
 
         if (file_exists($ytdlpPath) && filesize($ytdlpPath) > 0) {
             $ver = shell_exec("$ytdlpPath --version");
-            $response = ['status' => 'success', 'message' => "Đã cập nhật yt-dlp!\nVersion: " . trim($ver)];
+            $response = ['status' => 'success', 'message' => "yt-dlp updated successfully!\nVersion: " . trim($ver)];
         } else {
-            $response = ['status' => 'error', 'message' => "Lỗi tải yt-dlp!\nLog: " . $output];
+            $response = ['status' => 'error', 'message' => "Failed to download yt-dlp!\nLog: " . $output];
         }
     }
 
     elseif ($action === 'install_sys_pkg') {
         if (empty($ephemeralSudoPass)) {
-            $response = ['status' => 'error', 'message' => 'LỖI: Chưa nhập mật khẩu Sudo!'];
+            $response = ['status' => 'error', 'message' => 'ERROR: Sudo password is required!'];
         } else {
             $escapedPass = escapeshellarg($ephemeralSudoPass . "\n");
             $sysCmd = "echo $escapedPass | sudo -S -p '' apt-get update && echo $escapedPass | sudo -S -p '' apt-get install -y mpv ffmpeg procps psmisc python3 2>&1";
             $output = shell_exec($sysCmd);
 
             if (stristr($output, 'Permission denied') || stristr($output, 'incorrect password')) {
-                $response = ['status' => 'error', 'message' => 'LỖI: Mật khẩu Sudo không đúng!'];
+                $response = ['status' => 'error', 'message' => 'ERROR: Incorrect Sudo password!'];
             } else {
-                $response = ['status' => 'success', 'message' => "Cài đặt hoàn tất!\n" . $output];
+                $response = ['status' => 'success', 'message' => "Installation completed!\n" . $output];
             }
         }
     }
 
     elseif ($action === 'run_cmd') {
         if (!ENABLE_SHELL_TERMINAL) {
-            $response = ['status' => 'terminal', 'output' => 'LỖI: Shell Terminal đã bị khóa bởi Cấu hình Bảo mật! (ENABLE_SHELL_TERMINAL = false)'];
+            $response = ['status' => 'terminal', 'output' => 'ERROR: Shell Terminal is disabled by security configuration! (ENABLE_SHELL_TERMINAL = false)'];
         } else {
             $userCmd = trim($_POST['cmd'] ?? '');
             if (!empty($userCmd)) {
                 if (preg_match('/\bsudo\b/', $userCmd)) {
                     if (empty($ephemeralSudoPass)) {
-                        $output = "LỖI: Chưa nhập mật khẩu Sudo!";
+                        $output = "ERROR: Sudo password is required!";
                     } else {
                         $escapedPass = escapeshellarg($ephemeralSudoPass . "\n");
                         $formattedCmd = preg_replace('/\bsudo\b/', "echo $escapedPass | sudo -S -p ''", $userCmd);
@@ -183,34 +183,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
         $cookieContent = $_POST['cookie_content'] ?? '';
         if (!empty(trim($cookieContent))) {
             file_put_contents($cookieFile, $cookieContent);
-            $response = ['status' => 'success', 'message' => 'Lưu cookies.txt thành công!'];
+            $response = ['status' => 'success', 'message' => 'Saved cookies.txt successfully!'];
         } else {
-            $response = ['status' => 'error', 'message' => 'Nội dung cookie bị trống!'];
+            $response = ['status' => 'error', 'message' => 'Cookie content is empty!'];
         }
     }
     elseif ($action === 'upload_cookies' && isset($_FILES['cookie_file'])) {
         if ($_FILES['cookie_file']['error'] === UPLOAD_ERR_OK) {
             move_uploaded_file($_FILES['cookie_file']['tmp_name'], $cookieFile);
-            $response = ['status' => 'success', 'message' => 'Upload cookies.txt thành công!'];
+            $response = ['status' => 'success', 'message' => 'Uploaded cookies.txt successfully!'];
         } else {
-            $response = ['status' => 'error', 'message' => 'Lỗi upload cookie!'];
+            $response = ['status' => 'error', 'message' => 'Failed to upload cookies!'];
         }
     }
     elseif ($action === 'delete_cookies') {
         if (file_exists($cookieFile)) @unlink($cookieFile);
-        $response = ['status' => 'success', 'message' => 'Đã xóa file cookies.txt!'];
+        $response = ['status' => 'success', 'message' => 'Deleted cookies.txt!'];
     }
 
     elseif ($action === 'stop') {
         exec("killall -9 mpv > /dev/null 2>&1 || pkill -9 mpv > /dev/null 2>&1");
         if (file_exists($socketFile)) @unlink($socketFile);
-        file_put_contents($logFile, "[SYSTEM] Đã dừng MPV.\n", FILE_APPEND);
-        $response = ['status' => 'error', 'message' => 'Đã dừng MPV!'];
+        file_put_contents($logFile, "[SYSTEM] Stopped MPV.\n", FILE_APPEND);
+        $response = ['status' => 'error', 'message' => 'MPV process stopped!'];
     }
 
     elseif ($action === 'clear_log') {
         file_put_contents($logFile, "");
-        $response = ['status' => 'success', 'message' => 'Đã xóa log!'];
+        $response = ['status' => 'success', 'message' => 'Cleared log!'];
     }
 
     elseif ($action === 'toggle_pause') {
@@ -255,19 +255,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
             $mpvCmd .= " --ytdl-raw-options=" . escapeshellarg(implode(',', $rawOpts));
 
             exec("nohup setsid $mpvCmd " . $escaped_url . " > " . escapeshellarg($logFile) . " 2>&1 &");
-            $response = ['status' => 'success', 'message' => 'Đã phát nhạc!'];
+            $response = ['status' => 'success', 'message' => 'Playback started!'];
         } else {
-            $response = ['status' => 'error', 'message' => 'Link Youtube không hợp lệ!'];
+            $response = ['status' => 'error', 'message' => 'Invalid YouTube URL!'];
         }
     }
 
     elseif ($action === 'get_status') {
         $runningMpv = trim(shell_exec("pgrep -a mpv 2>/dev/null || ps aux | grep [m]pv"));
-        $logContent = file_exists($logFile) ? file_get_contents($logFile) : "Chưa có log.";
+        $logContent = file_exists($logFile) ? file_get_contents($logFile) : "No log available.";
         $hasCookie = file_exists($cookieFile) && filesize($cookieFile) > 0;
         $cookieSize = $hasCookie ? filesize($cookieFile) : 0;
 
-        $mediaData = ['time_pos' => 0, 'duration' => 0, 'paused' => false, 'volume' => 100, 'title' => 'Đang tải...'];
+        $mediaData = ['time_pos' => 0, 'duration' => 0, 'paused' => false, 'volume' => 100, 'title' => 'Loading...'];
         if ($runningMpv && file_exists($socketFile)) {
             $mediaData = queryMpvStatus();
         }
@@ -300,7 +300,7 @@ $initCookieText = $hasCookie ? file_get_contents($cookieFile) : "";
 ?>
 
 <!DOCTYPE html>
-<html lang="vi">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -395,11 +395,11 @@ $initCookieText = $hasCookie ? file_get_contents($cookieFile) : "";
 <body>
 
 <?php if (!$isAuthenticated): ?>
-<!-- MÀN HÌNH ĐĂNG NHẬP BẢO MẬT -->
+<!-- SECURE LOGIN SCREEN -->
 <div class="login-box">
     <h2>🔒 Access Control</h2>
-    <input type="password" id="authPasscode" placeholder="Nhập mật khẩu Passcode..." style="margin-bottom: 12px;">
-    <button type="button" class="btn-action" onclick="login()">Đăng Nhập</button>
+    <input type="password" id="authPasscode" placeholder="Enter passcode..." style="margin-bottom: 12px;">
+    <button type="button" class="btn-action" onclick="login()">Login</button>
     <div id="loginAlert" class="alert error" style="margin-top: 12px;"></div>
 </div>
 
@@ -424,14 +424,14 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
 </script>
 
 <?php else: ?>
-<!-- MAIN DASHBOARD (CHỈ HIỂN THỊ KHI ĐÃ AUTH) -->
+<!-- MAIN DASHBOARD (AUTHENTICATED ONLY) -->
 <div class="dashboard">
     <!-- Header -->
     <div class="header">
         <h1>⚡ Control Center</h1>
         <div class="status-indicator">
             <span class="dot"></span> Authenticated Session
-            <a href="?logout=1" style="color: var(--accent-red); text-decoration: none; margin-left: 10px;">[Đăng xuất]</a>
+            <a href="?logout=1" style="color: var(--accent-red); text-decoration: none; margin-left: 10px;">[Logout]</a>
         </div>
     </div>
 
@@ -453,10 +453,10 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
             <div class="panel-title">Media Launcher</div>
 
             <div style="display: flex; flex-direction: column; gap: 8px;">
-                <input type="text" id="ytUrl" placeholder="Dán link Youtube / Youtube Music..." autocomplete="off">
+                <input type="text" id="ytUrl" placeholder="Paste YouTube / YouTube Music link..." autocomplete="off">
                 <div class="btn-group">
-                    <button type="button" onclick="sendAction('play')" class="btn-play">▶ Phát Nhạc</button>
-                    <button type="button" onclick="sendAction('stop')" class="btn-stop">⏹ Dừng MPV</button>
+                    <button type="button" onclick="sendAction('play')" class="btn-play">▶ Play Audio</button>
+                    <button type="button" onclick="sendAction('stop')" class="btn-stop">⏹ Stop MPV</button>
                 </div>
             </div>
 
@@ -464,7 +464,7 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
             <div id="playerSection" style="<?php echo $runningMpv ? '' : 'display:none;'; ?>">
                 <div class="panel-title" style="margin-bottom: 8px;">Now Playing</div>
                 <div class="player-card">
-                    <div class="player-title" id="mediaTitle">🎵 Đang tải thông tin...</div>
+                    <div class="player-title" id="mediaTitle">🎵 Loading info...</div>
 
                     <div class="progress-box">
                         <span class="time-text" id="timeCurrent">00:00</span>
@@ -496,7 +496,7 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
                     <span>System Output Log</span>
                     <button type="button" class="btn-sec btn-sm" onclick="sendAction('clear_log')">Clear Log</button>
                 </div>
-                <div class="log-box" id="mpvLogBox">Đang chờ log...</div>
+                <div class="log-box" id="mpvLogBox">Waiting for log...</div>
             </div>
         </div>
 
@@ -505,15 +505,15 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
             <!-- Cookies Manager -->
             <div>
                 <div class="panel-title" style="margin-bottom: 8px;">
-                    <span>Youtube Cookies</span>
+                    <span>YouTube Cookies</span>
                     <span id="cookieBadge"></span>
                 </div>
-                <textarea id="cookieContent" placeholder="Dán nội dung cookies.txt (Netscape format)..."><?php echo htmlspecialchars($initCookieText); ?></textarea>
+                <textarea id="cookieContent" placeholder="Paste cookies.txt content here (Netscape format)..."><?php echo htmlspecialchars($initCookieText); ?></textarea>
                 <div class="btn-group" style="margin-top: 8px;">
-                    <button type="button" onclick="sendAction('save_cookies_text')" class="btn-action btn-sm">Lưu Text</button>
+                    <button type="button" onclick="sendAction('save_cookies_text')" class="btn-action btn-sm">Save Text</button>
                     <input type="file" id="cookieFile" style="display:none;" onchange="uploadCookieFile()">
                     <button type="button" onclick="document.getElementById('cookieFile').click()" class="btn-sec btn-sm">Upload File</button>
-                    <button type="button" onclick="sendAction('delete_cookies')" class="btn-sec btn-sm" style="color:var(--accent-red);">Xóa Cookie</button>
+                    <button type="button" onclick="sendAction('delete_cookies')" class="btn-sec btn-sm" style="color:var(--accent-red);">Delete Cookie</button>
                 </div>
             </div>
 
@@ -523,7 +523,7 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
             <div>
                 <div class="panel-title" style="margin-bottom: 8px; color: var(--accent-yellow);">Sudo & Maintenance</div>
                 <input type="password" id="sudoPass" style="border-color: rgba(251, 191, 36, 0.3); background-color: rgba(251, 191, 36, 0.05);"
-                       placeholder="🔑 Nhập Mật khẩu SUDO (RAM Only)..." autocomplete="off">
+                       placeholder="🔑 Enter SUDO password (RAM Only)..." autocomplete="off">
                 <div class="btn-group" style="margin-top: 8px;">
                     <button type="button" onclick="sendAction('update_ytdlp')" class="btn-sec btn-sm">yt-dlp Stable</button>
                     <button type="button" onclick="sendAction('update_ytdlp_nightly')" class="btn-sec btn-sm">yt-dlp Nightly</button>
@@ -540,7 +540,7 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
                     <span style="font-size:9px; color: var(--accent-red);"><?php echo ENABLE_SHELL_TERMINAL ? 'ENABLED' : 'DISABLED'; ?></span>
                 </div>
                 <div style="display:flex; gap:8px;">
-                    <input type="text" id="shellCmd" placeholder="<?php echo ENABLE_SHELL_TERMINAL ? 'Lệnh shell...' : 'Terminal bị khóa trong config'; ?>" <?php echo ENABLE_SHELL_TERMINAL ? '' : 'disabled'; ?> autocomplete="off">
+                    <input type="text" id="shellCmd" placeholder="<?php echo ENABLE_SHELL_TERMINAL ? 'Shell command...' : 'Terminal disabled in config'; ?>" <?php echo ENABLE_SHELL_TERMINAL ? '' : 'disabled'; ?> autocomplete="off">
                     <button type="button" onclick="sendAction('run_cmd')" class="btn-action btn-sm" style="width: 80px;" <?php echo ENABLE_SHELL_TERMINAL ? '' : 'disabled'; ?>>Exec</button>
                 </div>
                 <div class="term-output" id="termOutput" style="margin-top: 8px;"></div>
@@ -596,7 +596,7 @@ async function sendAction(actionName, extraData = {}) {
 
         if (data.status === 'terminal') {
             termOutput.style.display = 'block';
-            termOutput.textContent = data.output || 'Lệnh đã thực thi.';
+            termOutput.textContent = data.output || 'Command executed.';
         } else if (data.message && actionName !== 'set_volume') {
             alertBox.style.display = 'block';
             alertBox.className = 'alert ' + (data.status === 'success' ? 'success' : 'error');
@@ -607,7 +607,7 @@ async function sendAction(actionName, extraData = {}) {
     } catch (err) {
         alertBox.style.display = 'block';
         alertBox.className = 'alert error';
-        alertBox.textContent = 'Lỗi kết nối tới Server hoặc CSRF Token sai!';
+        alertBox.textContent = 'Server connection error or invalid CSRF token!';
     }
 }
 
@@ -691,12 +691,12 @@ async function checkStatus() {
         if (data.hasCookie) {
             cookieBadge.innerHTML = `<span style="color:var(--accent-green); font-size:10px;">✔ Active (${data.cookieSize} B)</span>`;
         } else {
-            cookieBadge.innerHTML = `<span style="color:var(--accent-red); font-size:10px;">✘ Trống</span>`;
+            cookieBadge.innerHTML = `<span style="color:var(--accent-red); font-size:10px;">✘ Empty</span>`;
         }
 
         if (data.mpvLog !== undefined) {
             const isScrolledToBottom = mpvLogBox.scrollHeight - mpvLogBox.clientHeight <= mpvLogBox.scrollTop + 50;
-            mpvLogBox.textContent = data.mpvLog || 'Chưa có dữ liệu log.';
+            mpvLogBox.textContent = data.mpvLog || 'No log data available.';
             if (isScrolledToBottom) {
                 mpvLogBox.scrollTop = mpvLogBox.scrollHeight;
             }

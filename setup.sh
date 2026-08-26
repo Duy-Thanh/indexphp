@@ -17,9 +17,9 @@ echo -e "${BLUE}=====================================================${NC}"
 echo -e "${GREEN}  Control Center Installer for DroidSpaces-OSS      ${NC}"
 echo -e "${BLUE}=====================================================${NC}"
 
-# Kiểm tra quyền root
+# Root privileges check
 if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}[ERROR] Script này cần chạy với quyền ROOT trong container DroidSpaces!${NC}"
+    echo -e "${RED}[ERROR] This script must be run as ROOT inside the DroidSpaces container!${NC}"
     exit 1
 fi
 
@@ -28,7 +28,7 @@ BIN_DIR="${WEB_DIR}/bin"
 REPO_URL="https://github.com/Duy-Thanh/indexphp.git"
 SERVICE_NAME="control-center"
 
-echo -e "${YELLOW}[1/6] Cập nhật hệ thống & cài đặt packages (bao gồm git)...${NC}"
+echo -e "${YELLOW}[1/6] Updating system & installing packages (including git)...${NC}"
 apt-get update -qq
 apt-get install -y --no-install-recommends \
     git \
@@ -42,28 +42,28 @@ apt-get install -y --no-install-recommends \
     ca-certificates \
     wget
 
-echo -e "${YELLOW}[2/6] Clone / Pull source code từ GitHub (${REPO_URL})...${NC}"
+echo -e "${YELLOW}[2/6] Cloning / Pulling source code from GitHub (${REPO_URL})...${NC}"
 if [ -d "${WEB_DIR}/.git" ]; then
-    echo -e "${BLUE}Thư mục đã chứa git repo, đang tiến hành pull bản mới nhất...${NC}"
+    echo -e "${BLUE}Directory already contains a git repo. Pulling latest changes...${NC}"
     git -C "${WEB_DIR}" fetch --all
     git -C "${WEB_DIR}" reset --hard origin/main || git -C "${WEB_DIR}" reset --hard origin/master
     git -C "${WEB_DIR}" pull
 else
-    echo -e "${BLUE}Thực hiện git clone về ${WEB_DIR}...${NC}"
+    echo -e "${BLUE}Cloning repository into ${WEB_DIR}...${NC}"
     rm -rf "${WEB_DIR}"
     git clone "${REPO_URL}" "${WEB_DIR}"
 fi
 
-echo -e "${YELLOW}[3/6] Tạo thư mục bin tại ${WEB_DIR}/bin...${NC}"
+echo -e "${YELLOW}[3/6] Creating bin directory at ${WEB_DIR}/bin...${NC}"
 mkdir -p "${BIN_DIR}"
 chmod -R 755 "${WEB_DIR}"
 
-echo -e "${YELLOW}[4/6] Tải phiên bản yt-dlp mới nhất vào ${BIN_DIR}/yt-dlp...${NC}"
+echo -e "${YELLOW}[4/6] Downloading latest yt-dlp binary to ${BIN_DIR}/yt-dlp...${NC}"
 curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "${BIN_DIR}/yt-dlp"
 chmod +x "${BIN_DIR}/yt-dlp"
 echo -e "${GREEN}yt-dlp version: $(${BIN_DIR}/yt-dlp --version)${NC}"
 
-echo -e "${YELLOW}[5/6] Cấu hình Systemd Service (${SERVICE_NAME}.service)...${NC}"
+echo -e "${YELLOW}[5/6] Configuring Systemd Service (${SERVICE_NAME}.service)...${NC}"
 CAT_SERVICE=$(cat <<EOF
 [Unit]
 Description=Control Center Web UI (MPV Engine)
@@ -84,18 +84,18 @@ EOF
 
 echo "${CAT_SERVICE}" > "/etc/systemd/system/${SERVICE_NAME}.service"
 
-echo -e "${YELLOW}[6/6] Kích hoạt và khởi chạy service...${NC}"
+echo -e "${YELLOW}[6/6] Enabling and starting service...${NC}"
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
 systemctl restart "${SERVICE_NAME}"
 
 echo -e "${BLUE}=====================================================${NC}"
-echo -e "${GREEN}✔ ĐÃ TỰ ĐỘNG HÓA CÀI ĐẶT THÀNH CÔNG!${NC}"
+echo -e "${GREEN}✔ AUTOMATED INSTALLATION COMPLETED SUCCESSFULLY!${NC}"
 echo -e "${BLUE}=====================================================${NC}"
-echo -e "📌 Source code đã được tự động kéo về từ GitHub."
-echo -e "📌 Server đang chạy tại IP Container / Host Port: ${GREEN}http://0.0.0.0:8080${NC}"
-echo -e "📌 Quản lý service:"
-echo -e "   - Xem log status : ${YELLOW}systemctl status ${SERVICE_NAME}${NC}"
-echo -e "   - Khởi động lại  : ${YELLOW}systemctl restart ${SERVICE_NAME}${NC}"
-echo -e "   - Xem log php    : ${YELLOW}journalctl -u ${SERVICE_NAME} -f${NC}"
+echo -e "📌 Source code automatically pulled from GitHub."
+echo -e "📌 Server running at Container IP / Host Port: ${GREEN}http://0.0.0.0:8080${NC}"
+echo -e "📌 Service management commands:"
+echo -e "   - Check status  : ${YELLOW}systemctl status ${SERVICE_NAME}${NC}"
+echo -e "   - Restart service: ${YELLOW}systemctl restart ${SERVICE_NAME}${NC}"
+echo -e "   - View PHP logs  : ${YELLOW}journalctl -u ${SERVICE_NAME} -f${NC}"
 echo -e "${BLUE}=====================================================${NC}"
