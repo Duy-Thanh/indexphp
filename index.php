@@ -712,6 +712,17 @@ async function checkStatus() {
     } catch(e) {}
 }
 setInterval(checkStatus, 1200);
+
+// Tự động fetch lại status ngay lập tức khi bật lại màn hình / active tab
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+        checkStatus();
+    }
+});
+
+window.addEventListener('focus', () => {
+    checkStatus();
+});
 </script>
 <?php endif; ?>
 
