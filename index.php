@@ -308,6 +308,10 @@ $initCookieText = $hasCookie ? file_get_contents($cookieFile) : "";
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#0a0b0e">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>Control Center</title>
     <style>
         :root {
@@ -788,6 +792,11 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('focus', () => {
     triggerStatusCheckNow();
 });
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(err => console.log('SW error:', err));
+}
 </script>
 <?php endif; ?>
 

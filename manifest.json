@@ -1,0 +1,15 @@
+{
+  "name": "MPV Control Center",
+  "short_name": "MPV Control",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0a0b0e",
+  "theme_color": "#0a0b0e",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/1384/1384060.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
