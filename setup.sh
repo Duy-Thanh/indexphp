@@ -84,6 +84,9 @@ EOF
 
 echo "${CAT_SERVICE}" > "/etc/systemd/system/${SERVICE_NAME}.service"
 
+echo -e "${YELLOW} Fixing permission"
+usermod -aG audio www-data
+
 echo -e "${YELLOW}[6/6] Enabling and starting service...${NC}"
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
