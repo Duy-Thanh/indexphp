@@ -235,16 +235,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
 
             file_put_contents($logFile, "=== MPV SESSION LAUNCHED: " . date('Y-m-d H:i:s') . " ===\nURL: $raw_url\n\n");
 
-            // Lấy toàn bộ biến môi trường hiện tại của process (hoặc gán PULSE_SERVER nếu có)
+            // Lấy giá trị PULSE_SERVER và XDG_RUNTIME_DIR hiện tại
             $pulseServer = getenv('PULSE_SERVER') ?: trim(shell_exec("echo \$PULSE_SERVER"));
             $xdgDir = getenv('XDG_RUNTIME_DIR') ?: trim(shell_exec("echo \$XDG_RUNTIME_DIR"));
 
-            // Bơm trực tiếp env vào trước lệnh mpv
-            $envPrefix = "export HOME=/tmp; ";
-            if (!empty($pulseServer)) $envPrefix .= "export PULSE_SERVER=" . escapeshellarg($pulseServer) . "; ";
-            if (!empty($xdgDir)) $envPrefix .= "export XDG_RUNTIME_DIR=" . escapeshellarg($xdgDir) . "; ";
+            // Tạo chuỗi env inline
+            $envInline = "";
+            if (!empty($pulseServer)) $envInline .= "PULSE_SERVER=" . escapeshellarg($pulseServer) . " ";
+            if (!empty($xdgDir)) $envInline .= "XDG_RUNTIME_DIR=" . escapeshellarg($xdgDir) . " ";
 
-            // Lệnh MPV nguyên bản của mày, đéo thêm bớt cờ ao nào hết
+            // Lệnh MPV gốc của mày
             $mpvCmd = "mpv --no-video "
                     . "--force-seekable=yes "
                     . "--cache=yes "
@@ -264,8 +264,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
 
             $mpvCmd .= " --ytdl-raw-options=" . escapeshellarg(implode(',', $rawOpts));
 
-            // Thực thi với env prefix
-            exec("nohup setsid bash -c " . escapeshellarg($envPrefix . $mpvCmd . " " . $escaped_url) . " > " . escapeshellarg($logFile) . " 2>&1 &");
+            // Ghép thẳng: PULSE_SERVER=xxx XDG_RUNTIME_DIR=yyy nohup setsid mpv ...
+            $fullCmd = "nohup setsid {$envInline}{$mpvCmd} {$escaped_url} > " . escapeshellarg($logFile) . " 2>&1 &";
+
+            exec($fullCmd);
             $response = ['status' => 'success', 'message' => 'Playback started!'];
         } else {
             $response = ['status' => 'error', 'message' => 'Invalid YouTube URL!'];
