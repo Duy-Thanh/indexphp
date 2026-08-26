@@ -242,9 +242,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
             if (!empty($pulseServer)) $envPrefix .= "PULSE_SERVER=" . escapeshellarg($pulseServer) . " ";
             if (!empty($xdgDir)) $envPrefix .= "XDG_RUNTIME_DIR=" . escapeshellarg($xdgDir) . " ";
 
-            $mpvCmd = "PULSE_SERVER='unix:/tmp/.pulse-socket' "
-                    . "XDG_RUNTIME_DIR='/run/user/0' "
-                    . "mpv --no-video "
+            $mpvCmd = "env PULSE_SERVER='unix:/tmp/.pulse-socket' XDG_RUNTIME_DIR='/run/user/0' mpv --no-video "
                     . "--force-seekable=yes "
                     . "--cache=yes "
                     . "--demuxer-max-bytes=100M "
