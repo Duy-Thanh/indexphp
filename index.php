@@ -8,6 +8,14 @@ define('ENABLE_SHELL_TERMINAL', true); // ⚠️ Set 'true' ONLY if you want to 
 // Secure session cookie configuration
 ini_set('session.cookie_httponly', 1);
 ini_set('session.use_strict_mode', 1);
+
+// Tự động chuyển hướng từ 0.0.0.0 sang localhost để đảm bảo Secure Context cho PWA
+if (isset($_SERVER['HTTP_HOST']) && strpos($_SERVER['HTTP_HOST'], '0.0.0.0') !== false) {
+    $redirectUrl = 'http://localhost' . (isset($_SERVER['SERVER_PORT']) ? ':' . $_SERVER['SERVER_PORT'] : '') . $_SERVER['REQUEST_URI'];
+    header("Location: $redirectUrl", true, 301);
+    exit;
+}
+
 session_start();
 
 // 1. AUTHENTICATION CHECK
@@ -489,6 +497,17 @@ $initCookieText = $hasCookie ? file_get_contents($cookieFile) : "";
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
+    <!-- REGISTER SERVICE WORKER TRỰC TIẾP TRONG HEAD -->
+    <script>
+    if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+            navigator.serviceWorker.register('./sw.js', { scope: './' })
+                .then(reg => console.log('SW Registered successfully:', reg.scope))
+                .catch(err => console.error('SW Register Error:', err));
+        });
+    }
+    </script>
+
     <style>
         :root {
             --bg-primary: #0a0b0e;
@@ -819,7 +838,7 @@ function escapeHtml(str) {
 }
 
 function formatTime(secs) {
-    if (!secs || isNaN(secs) || secs < 0) return "00:00";
+    if (!secs || isNaN(secs) || secs <= 0) return "YTM Track";
     const totalSecs = Math.floor(parseFloat(secs));
     const m = Math.floor(totalSecs / 60);
     const s = totalSecs % 60;
@@ -1148,13 +1167,6 @@ window.addEventListener('focus', () => {
 });
 </script>
 
-<!-- Service Worker Registration for PWA -->
-<script>
-if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(err => console.log('SW error:', err));
-}
-</script>
-
 <script>
 // =========================================================================
 // PWA SHARE TARGET & SHORTCUTS HANDLER
@@ -1194,6 +1206,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 });
 </script>
+
 <?php endif; ?>
 
 </body>

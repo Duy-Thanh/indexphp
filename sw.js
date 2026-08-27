@@ -1,6 +1,6 @@
 const CACHE_NAME = 'mpv-control-v3';
 
-// Chỉ Precache các tài nguyên tĩnh BẤT BIẾN cục bộ
+// Danh sách static asset local
 const STATIC_ASSETS = [
     './manifest.json',
     './icon-192.png',
@@ -33,7 +33,7 @@ self.addEventListener('activate', (e) => {
     self.clients.claim();
 });
 
-// 3. Fetch Event - Bỏ qua hoàn toàn index.php / HTML Navigation / POST / XHR
+// 3. Fetch Event - Bỏ qua hoàn toàn index.php / Navigation / POST / XHR
 self.addEventListener('fetch', (e) => {
     const request = e.request;
 
@@ -42,8 +42,9 @@ self.addEventListener('fetch', (e) => {
         return;
     }
 
-    // Chỉ áp dụng Cache cho đúng các Static Assets trong danh sách STATIC_ASSETS
-    const isStaticAsset = STATIC_ASSETS.some(asset => request.url.endsWith(asset.replace('./', '')));
+    // Convert STATIC_ASSETS sang danh sách Absolute URLs chuẩn xác 100%
+    const staticUrls = STATIC_ASSETS.map(a => new URL(a, self.location).href);
+    const isStaticAsset = staticUrls.includes(request.url);
 
     if (isStaticAsset) {
         e.respondWith(
@@ -54,5 +55,5 @@ self.addEventListener('fetch', (e) => {
         return;
     }
 
-    // Mọi Request còn lại (Bao gồm Navigation tới index.php) LUÔN ĐI THẲNG NETWORK
+    // Mọi Request còn lại (kể cả GET Navigation tới index.php) LUÔN ĐI THẲNG NETWORK
 });
