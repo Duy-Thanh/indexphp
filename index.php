@@ -33,10 +33,6 @@ if (isset($_GET['logout'])) {
     exit;
 }
 
-// 🔑 QUAN TRỌNG: Đóng Session ngay để tránh PHP Session Locking làm treo request AJAX
-$csrfToken = $_SESSION['csrf_token'] ?? '';
-session_write_close();
-
 // 2. BLOCK AJAX REQUEST IF UNAUTHENTICATED OR INVALID CSRF TOKEN
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WITH'])) {
     header('Content-Type: application/json');
@@ -49,7 +45,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
 
     // CSRF Protection Check
     $clientCsrf = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
-    if (empty($csrfToken) || !hash_equals($csrfToken, $clientCsrf)) {
+    if (empty($_SESSION['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $clientCsrf)) {
         http_response_code(403);
         echo json_encode(['status' => 'error', 'message' => 'SECURITY ERROR: Invalid CSRF Token!']);
         exit;
@@ -70,10 +66,17 @@ putenv("PATH=$binDir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bi
 // Helper Functions
 function queryMpvStatus() {
     global $socketFile;
-    $result = ['time_pos' => 0, 'duration' => 0, 'paused' => false, 'volume' => 100, 'title' => 'Loading...'];
+    $result = [
+        'time_pos' => 0,
+        'duration' => 0,
+        'paused' => false,
+        'volume' => 100,
+        'title' => 'Loading...',
+        'playlist' => []
+    ];
     if (!file_exists($socketFile)) return $result;
 
-    $socket = @stream_socket_client("unix://$socketFile", $errno, $errstr, 0.1);
+    $socket = @stream_socket_client("unix://$socketFile", $errno, $errstr, 0.2);
     if (!$socket) return $result;
 
     stream_set_timeout($socket, 0, 100000); // 100ms max timeout per read
@@ -82,12 +85,13 @@ function queryMpvStatus() {
         json_encode(['command' => ['get_property', 'duration']]),
         json_encode(['command' => ['get_property', 'pause']]),
         json_encode(['command' => ['get_property', 'volume']]),
-        json_encode(['command' => ['get_property', 'media-title']])
+        json_encode(['command' => ['get_property', 'media-title']]),
+        json_encode(['command' => ['get_property', 'playlist']])
     ];
 
     @fwrite($socket, implode("\n", $cmds) . "\n");
     $responses = [];
-    for ($i = 0; $i < 5; $i++) {
+    for ($i = 0; $i < 6; $i++) {
         $line = @fgets($socket);
         if ($line !== false) $responses[] = json_decode(trim($line), true);
     }
@@ -98,31 +102,230 @@ function queryMpvStatus() {
     if (isset($responses[2]['data'])) $result['paused'] = (bool)$responses[2]['data'];
     if (isset($responses[3]['data'])) $result['volume'] = (int)$responses[3]['data'];
     if (isset($responses[4]['data'])) $result['title'] = (string)$responses[4]['data'];
+    if (isset($responses[5]['data']) && is_array($responses[5]['data'])) $result['playlist'] = $responses[5]['data'];
 
     return $result;
+}
+
+// STRICT URL & DOMAIN VALIDATOR (Chống SSRF và Arbitrary Protocol Injection)
+function isValidYouTubeUrl($url) {
+    if (!filter_var($url, FILTER_VALIDATE_URL)) {
+        return false;
+    }
+
+    $parsedUrl = parse_url($url);
+    if (!$parsedUrl || empty($parsedUrl['scheme']) || empty($parsedUrl['host'])) {
+        return false;
+    }
+
+    // 1. Chỉ chấp nhận HTTP/HTTPS scheme
+    $scheme = strtolower($parsedUrl['scheme']);
+    if (!in_array($scheme, ['http', 'https'], true)) {
+        return false;
+    }
+
+    // 2. Tách Hostname và kiểm tra Whitelist chuẩn xác
+    $host = strtolower($parsedUrl['host']);
+    $allowedHosts = [
+        'youtube.com',
+        'www.youtube.com',
+        'music.youtube.com',
+        'm.youtube.com',
+        'youtu.be'
+    ];
+
+    if (in_array($host, $allowedHosts, true)) {
+        return true;
+    }
+
+    // Cho phép các subdomain hợp lệ của youtube.com (ví dụ: www.music.youtube.com nếu có)
+    if (substr($host, -12) === '.youtube.com') {
+        return true;
+    }
+
+    return false;
 }
 
 function sendSingleIpc($command) {
     global $socketFile;
     if (!file_exists($socketFile)) return false;
-    $socket = @stream_socket_client("unix://$socketFile", $errno, $errstr, 0.1);
+    $socket = @stream_socket_client("unix://$socketFile", $errno, $errstr, 0.2);
     if (!$socket) return false;
 
     stream_set_timeout($socket, 0, 100000);
-    @fwrite($socket, json_encode(['command' => $command]) . "\n");
+    $written = @fwrite($socket, json_encode(['command' => $command]) . "\n");
+    if ($written === false) {
+        @fclose($socket);
+        return false;
+    }
     $res = @fgets($socket);
     @fclose($socket);
-    return json_decode($res, true);
+    if ($res === false) return false;
+    $decoded = json_decode($res, true);
+    return (isset($decoded['error']) && $decoded['error'] === 'success') ? $decoded : false;
 }
 
-// 3. API ENDPOINTS
+function startMpvProcess($url, $binDir, $socketFile, $cookieFile, $logFile) {
+    exec("killall -9 mpv > /dev/null 2>&1 || pkill -9 mpv > /dev/null 2>&1");
+    if (file_exists($socketFile)) @unlink($socketFile);
+
+    file_put_contents($logFile, "=== MPV SESSION LAUNCHED: " . date('Y-m-d H:i:s') . " ===\nURL: $url\n\n");
+
+    // DYNAMIC AUDIO ENVIRONMENT DETECTION (Tự tương thích giữa DroidSpaces-OSS và openSUSE PC)
+    $envPrefix = "";
+    if (file_exists('/tmp/.pulse-socket')) {
+        $envPrefix = "env PULSE_SERVER='unix:/tmp/.pulse-socket' XDG_RUNTIME_DIR='/run/user/0' ";
+    }
+
+    $mpvCmd = $envPrefix . "mpv --no-video "
+            . "--ao=pulse,alsa,jack,openal,auto "
+            . "--force-seekable=yes "
+            . "--cache=yes "
+            . "--demuxer-max-bytes=100M "
+            . "--demuxer-readahead-secs=300 "
+            . "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5 "
+            . "--input-ipc-server=" . escapeshellarg($socketFile);
+
+    if (file_exists($binDir . '/yt-dlp')) {
+        $mpvCmd .= " --script-opts=ytdl_hook-ytdl_path=" . escapeshellarg($binDir . "/yt-dlp");
+    }
+
+    $rawOpts = ['keep-fragments='];
+    if (file_exists($cookieFile) && filesize($cookieFile) > 0) {
+        $rawOpts[] = "cookies=" . $cookieFile;
+    }
+
+    $mpvCmd .= " --ytdl-raw-options=" . escapeshellarg(implode(',', $rawOpts));
+
+    exec("nohup setsid $mpvCmd " . escapeshellarg($url) . " > " . escapeshellarg($logFile) . " 2>&1 &");
+}
+
+// 3. API ENDPOINTS (Protected via Auth & CSRF)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WITH'])) {
     $action = $_POST['action'] ?? '';
     $ephemeralSudoPass = $_POST['sudo_pass'] ?? '';
 
     $response = ['status' => 'error', 'message' => 'Invalid action!'];
 
-    if ($action === 'update_ytdlp' || $action === 'update_ytdlp_nightly') {
+    if ($action === 'play' && !empty($_POST['url'])) {
+        $raw_url = trim($_POST['url']);
+
+        if (isValidYouTubeUrl($raw_url)) {
+            startMpvProcess($raw_url, $binDir, $socketFile, $cookieFile, $logFile);
+            $response = ['status' => 'success', 'message' => 'Playback started!'];
+        } else {
+            $response = ['status' => 'error', 'message' => 'SECURITY REJECTED: Invalid or Untrusted YouTube URL!'];
+        }
+    }
+
+    elseif ($action === 'enqueue' && !empty($_POST['url'])) {
+        $raw_url = trim($_POST['url']);
+
+        if (isValidYouTubeUrl($raw_url)) {
+            $runningMpv = trim(shell_exec("pgrep -a mpv 2>/dev/null || ps aux | grep [m]pv"));
+            $ipcSuccess = false;
+
+            if ($runningMpv && file_exists($socketFile)) {
+                $ipcRes = sendSingleIpc(['loadfile', $raw_url, 'append']);
+                if ($ipcRes !== false) {
+                    $ipcSuccess = true;
+                    $response = ['status' => 'success', 'message' => 'Track added to queue!'];
+                }
+            }
+
+            // Fallback Recovery: Nếu MPV không chạy hoặc socket bị chết, tự động khởi động MPV mới
+            if (!$ipcSuccess) {
+                startMpvProcess($raw_url, $binDir, $socketFile, $cookieFile, $logFile);
+                $response = ['status' => 'success', 'message' => 'MPV process recovered & started with track!'];
+            }
+        } else {
+            $response = ['status' => 'error', 'message' => 'SECURITY REJECTED: Invalid or Untrusted YouTube URL!'];
+        }
+    }
+
+    elseif ($action === 'next_track') {
+        sendSingleIpc(['playlist-next']);
+        $response = ['status' => 'success', 'message' => 'Skipped to next track!'];
+    }
+
+    elseif ($action === 'prev_track') {
+        sendSingleIpc(['playlist-prev']);
+        $response = ['status' => 'success', 'message' => 'Back to previous track!'];
+    }
+
+    elseif ($action === 'search_yt') {
+        $query = trim($_POST['query'] ?? '');
+        $limit = isset($_POST['limit']) ? (int)$_POST['limit'] : 10;
+        $provider = trim($_POST['provider'] ?? 'ytsearch');
+
+        if ($limit < 1) $limit = 5;
+        if ($limit > 50) $limit = 50;
+
+        if (empty($query)) {
+            $response = ['status' => 'error', 'message' => 'Search query is empty!'];
+        } else {
+            $ytdlpBin = file_exists($binDir . '/yt-dlp') ? $binDir . '/yt-dlp' : 'yt-dlp';
+
+            if ($provider === 'ytmsearch') {
+                // YouTube Music Search qua URL Extractor
+                $encodedQuery = urlencode($query);
+                $targetUrl = "https://music.youtube.com/search?q={$encodedQuery}";
+                $searchCmd = "$ytdlpBin " . escapeshellarg($targetUrl)
+                            . " --playlist-end {$limit} --extractor-args \"youtube:player_client=web_music\" --dump-single-json --flat-playlist 2>/dev/null";
+            } else {
+                // YouTube Standard Search qua Prefix
+                $searchCmd = "$ytdlpBin " . escapeshellarg("ytsearch{$limit}:$query")
+                            . " --playlist-end {$limit} --dump-single-json --flat-playlist 2>/dev/null";
+            }
+
+            $jsonOutput = shell_exec($searchCmd);
+            $parsed = json_decode($jsonOutput, true);
+
+            if (isset($parsed['entries']) && is_array($parsed['entries'])) {
+                $results = [];
+                foreach ($parsed['entries'] as $entry) {
+                    $itemUrl = $entry['url'] ?? '';
+                    $videoId = $entry['id'] ?? '';
+
+                    // Bỏ qua item là Browse Tab / Album không thể phát trực tiếp
+                    if (($entry['ie_key'] ?? '') === 'YoutubeTab' || strpos($itemUrl, '/browse/') !== false) {
+                        continue;
+                    }
+
+                    if (!empty($videoId) && (empty($itemUrl) || strpos($itemUrl, '/browse/') !== false)) {
+                        $itemUrl = "https://www.youtube.com/watch?v=" . $videoId;
+                    }
+
+                    // Ưu tiên tiêu đề chuẩn
+                    $title = $entry['title'] ?? ($entry['title_text'] ?? '');
+                    if (empty($title)) continue; // Bỏ qua nếu rỗng title
+
+                    // FALLBACK THUMBNAIL TỰ ĐỘNG
+                    $thumb = '';
+                    if (isset($entry['thumbnails'][0]['url']) && !empty($entry['thumbnails'][0]['url'])) {
+                        $thumb = $entry['thumbnails'][0]['url'];
+                    } elseif (!empty($videoId)) {
+                        // Tự tạo link thumbnail chuẩn của YouTube CDN nếu YTM không trả về
+                        $thumb = "https://i.ytimg.com/vi/{$videoId}/mqdefault.jpg";
+                    }
+
+                    $results[] = [
+                        'id' => $videoId,
+                        'url' => $itemUrl,
+                        'title' => $title,
+                        'duration' => $entry['duration'] ?? 0,
+                        'uploader' => $entry['uploader'] ?? ($entry['channel'] ?? ($provider === 'ytmsearch' ? 'YouTube Music' : 'Unknown')),
+                        'thumb' => $thumb
+                    ];
+                }
+                $response = ['status' => 'success', 'results' => $results];
+            } else {
+                $response = ['status' => 'error', 'message' => 'No search results found! Check yt-dlp version or cookies.'];
+            }
+        }
+    }
+
+    elseif ($action === 'update_ytdlp' || $action === 'update_ytdlp_nightly') {
         $ytdlpPath = $binDir . '/yt-dlp';
         $downloadUrl = ($action === 'update_ytdlp_nightly')
             ? "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp"
@@ -228,50 +431,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_SERVER['HTTP_X_REQUESTED_WI
         $response = ['status' => 'success', 'message' => "Volume: {$vol}%"];
     }
 
-    elseif ($action === 'play' && !empty($_POST['url'])) {
-        $raw_url = trim($_POST['url']);
-        $raw_url = str_replace('music.youtube.com', 'www.youtube.com', $raw_url);
-
-        if (filter_var($raw_url, FILTER_VALIDATE_URL) && (stristr($raw_url, 'youtube.com') || stristr($raw_url, 'youtu.be'))) {
-            $escaped_url = escapeshellarg($raw_url);
-            exec("killall mpv > /dev/null 2>&1 || pkill -9 mpv > /dev/null 2>&1");
-            if (file_exists($socketFile)) @unlink($socketFile);
-
-            file_put_contents($logFile, "=== MPV SESSION LAUNCHED: " . date('Y-m-d H:i:s') . " ===\nURL: $raw_url\n\n");
-
-            $mpvCmd = "env PULSE_SERVER='unix:/tmp/.pulse-socket' XDG_RUNTIME_DIR='/run/user/0' mpv --no-video "
-                    . "--force-seekable=yes "
-                    . "--cache=yes "
-                    . "--demuxer-max-bytes=100M "
-                    . "--demuxer-readahead-secs=300 "
-                    . "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5 "
-                    . "--input-ipc-server=" . escapeshellarg($socketFile);
-
-            if (file_exists($binDir . '/yt-dlp')) {
-                $mpvCmd .= " --script-opts=ytdl_hook-ytdl_path=" . escapeshellarg($binDir . "/yt-dlp");
-            }
-
-            $rawOpts = ['keep-fragments='];
-            if (file_exists($cookieFile) && filesize($cookieFile) > 0) {
-                $rawOpts[] = "cookies=" . $cookieFile;
-            }
-
-            $mpvCmd .= " --ytdl-raw-options=" . escapeshellarg(implode(',', $rawOpts));
-
-            exec("nohup setsid $mpvCmd " . $escaped_url . " > " . escapeshellarg($logFile) . " 2>&1 &");
-            $response = ['status' => 'success', 'message' => 'Playback started!'];
-        } else {
-            $response = ['status' => 'error', 'message' => 'Invalid YouTube URL!'];
-        }
-    }
-
     elseif ($action === 'get_status') {
         $runningMpv = trim(shell_exec("pgrep -a mpv 2>/dev/null || ps aux | grep [m]pv"));
         $logContent = file_exists($logFile) ? file_get_contents($logFile) : "No log available.";
         $hasCookie = file_exists($cookieFile) && filesize($cookieFile) > 0;
         $cookieSize = $hasCookie ? filesize($cookieFile) : 0;
 
-        $mediaData = ['time_pos' => 0, 'duration' => 0, 'paused' => false, 'volume' => 100, 'title' => 'Loading...'];
+        $mediaData = [
+            'time_pos' => 0,
+            'duration' => 0,
+            'paused' => false,
+            'volume' => 100,
+            'title' => 'Loading...',
+            'playlist' => []
+        ];
         if ($runningMpv && file_exists($socketFile)) {
             $mediaData = queryMpvStatus();
         }
@@ -308,11 +481,14 @@ $initCookieText = $hasCookie ? file_get_contents($cookieFile) : "";
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MPV Control Center</title>
+
+    <!-- PWA Metadata -->
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#0a0b0e">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <title>Control Center</title>
+
     <style>
         :root {
             --bg-primary: #0a0b0e;
@@ -354,16 +530,17 @@ $initCookieText = $hasCookie ? file_get_contents($cookieFile) : "";
 
         .main-grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 14px; }
 
-        input[type="text"], input[type="password"], textarea { width: 100%; padding: 12px; border: 1px solid var(--border-color); border-radius: 6px; background-color: var(--bg-input); color: var(--accent-green); font-family: inherit; font-size: 13px; outline: none; word-break: break-all; }
-        input[type="text"]:focus, input[type="password"]:focus, textarea:focus { border-color: var(--accent-blue); }
+        input[type="text"], input[type="password"], textarea, select { width: 100%; padding: 12px; border: 1px solid var(--border-color); border-radius: 6px; background-color: var(--bg-input); color: var(--accent-green); font-family: inherit; font-size: 13px; outline: none; word-break: break-all; }
+        input[type="text"]:focus, input[type="password"]:focus, textarea:focus, select:focus { border-color: var(--accent-blue); }
         textarea { height: 90px; resize: vertical; color: var(--accent-blue); }
 
         .btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
         button { min-height: 42px; padding: 10px 16px; border: none; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: pointer; font-family: inherit; transition: all 0.2s; display: inline-flex; align-items: center; justify-content: center; gap: 8px; white-space: nowrap; }
         button:hover { opacity: 0.88; transform: translateY(-1px); }
 
-        .btn-play { background-color: #dc2626; color: white; flex: 2 1 140px; }
-        .btn-stop { background-color: #1f2937; color: var(--accent-red); border: 1px solid var(--border-color); flex: 1 1 100px; }
+        .btn-play { background-color: #dc2626; color: white; flex: 2 1 120px; }
+        .btn-enqueue { background-color: #16a34a; color: white; flex: 1 1 90px; }
+        .btn-stop { background-color: #1f2937; color: var(--accent-red); border: 1px solid var(--border-color); flex: 1 1 80px; }
         .btn-action { background-color: #0284c7; color: white; width: 100%; }
         .btn-sec { background-color: #1e293b; color: var(--text-main); border: 1px solid var(--border-color); flex: 1 1 auto; }
         .btn-sm { min-height: 32px; padding: 6px 12px; font-size: 11px; }
@@ -379,6 +556,18 @@ $initCookieText = $hasCookie ? file_get_contents($cookieFile) : "";
         input[type="range"].vol-slider { -webkit-appearance: none; width: 100%; height: 6px; background: #1e2029; border-radius: 3px; outline: none; }
         input[type="range"].vol-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--accent-blue); cursor: pointer; }
 
+        /* Search UI */
+        .search-item { display: flex; gap: 10px; background: var(--bg-input); padding: 8px; border-radius: 6px; border: 1px solid var(--border-color); align-items: center; }
+        .search-thumb { width: 64px; height: 36px; border-radius: 4px; object-fit: cover; background: #000; }
+        .search-info { flex: 1; min-width: 0; }
+        .search-title { font-size: 12px; font-weight: bold; color: var(--accent-blue); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .search-sub { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
+        .search-btns { display: flex; gap: 4px; }
+
+        /* Queue List UI */
+        .queue-item { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: var(--bg-input); border: 1px solid var(--border-color); border-radius: 4px; font-size: 11px; }
+        .queue-item.active { border-color: var(--accent-green); background: rgba(52, 211, 153, 0.05); }
+
         .log-box, .term-output { background-color: #000; padding: 10px; border-radius: 6px; border: 1px solid var(--border-color); font-size: 11px; white-space: pre-wrap; word-break: break-all; max-height: 160px; overflow-y: auto; overflow-x: hidden; }
         .log-box { color: var(--accent-yellow); }
         .term-output { color: var(--accent-green); display: none; }
@@ -392,11 +581,25 @@ $initCookieText = $hasCookie ? file_get_contents($cookieFile) : "";
             body { padding: 8px; }
             .dep-grid { grid-template-columns: repeat(2, 1fr); }
             .main-grid { grid-template-columns: 1fr; }
-            .btn-play, .btn-stop { flex: 1 1 100%; }
+            .btn-play, .btn-enqueue, .btn-stop { flex: 1 1 100%; }
         }
         @media (max-width: 420px) {
             .dep-grid { grid-template-columns: 1fr; }
             .header { flex-direction: column; align-items: flex-start; }
+        }
+
+        /* 3-STATE INTERACTIVE SCROLLBAR */
+        html { color-scheme: dark !important; }
+        ::-webkit-scrollbar { width: 8px !important; height: 8px !important; }
+        ::-webkit-scrollbar-track { background: #08090c !important; border-radius: 4px !important; }
+        ::-webkit-scrollbar-thumb { background: #475569 !important; border-radius: 4px !important; border: 2px solid #08090c !important; }
+        ::-webkit-scrollbar-thumb:hover { background: #0284c7 !important; }
+        ::-webkit-scrollbar-thumb:active { background: #38bdf8 !important; }
+
+        @supports (scrollbar-color: auto) {
+            @supports not (selector(::-webkit-scrollbar)) {
+                * { scrollbar-width: thin; scrollbar-color: #475569 #08090c; }
+            }
         }
     </style>
 </head>
@@ -456,16 +659,43 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
 
     <!-- Main Grid -->
     <div class="main-grid">
-        <!-- LEFT COLUMN: Media Controller & Console -->
+        <!-- LEFT COLUMN: Media Controller & YouTube Search -->
         <div class="panel">
             <div class="panel-title">Media Launcher</div>
 
             <div style="display: flex; flex-direction: column; gap: 8px;">
                 <input type="text" id="ytUrl" placeholder="Paste YouTube / YouTube Music link..." autocomplete="off">
                 <div class="btn-group">
-                    <button type="button" onclick="sendAction('play')" class="btn-play">▶ Play Audio</button>
-                    <button type="button" onclick="sendAction('stop')" class="btn-stop">⏹ Stop MPV</button>
+                    <button type="button" onclick="sendAction('play')" class="btn-play">▶ Play Now</button>
+                    <button type="button" onclick="sendAction('enqueue')" class="btn-enqueue">+ Queue</button>
+                    <button type="button" onclick="sendAction('stop')" class="btn-stop">⏹ Stop</button>
                 </div>
+            </div>
+
+            <!-- Quick YouTube Search Box -->
+            <div style="margin-top: 4px;">
+                <div class="panel-title" style="margin-bottom: 8px;">🔎 Quick YouTube Search</div>
+                <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                    <input type="text" id="ytSearchInput" placeholder="Nhập tên bài hát, ca sĩ..." autocomplete="off" style="flex:2; min-width:140px;">
+
+                    <!-- Combo Box Chọn Provider (YouTube vs YT Music) -->
+                    <select id="ytSearchProvider" style="flex:1; min-width:95px; padding:0 6px; font-size:11px; cursor:pointer;">
+                        <option value="ytsearch" selected>🎵 YouTube</option>
+                        <option value="ytmsearch">🎧 YT Music</option>
+                    </select>
+
+                    <!-- Select Limit -->
+                    <select id="ytSearchLimit" style="width:55px; padding:0 4px; font-size:11px; cursor:pointer;">
+                        <option value="5">5</option>
+                        <option value="10" selected>10</option>
+                        <option value="15">15</option>
+                        <option value="20">20</option>
+                        <option value="30">30</option>
+                    </select>
+
+                    <button type="button" onclick="searchYoutube()" class="btn-action btn-sm" style="width: 70px;">Search</button>
+                </div>
+                <div id="searchResults" style="display:flex; flex-direction:column; gap:8px; margin-top:10px; width:100%; max-height:480px; overflow-y:auto; padding-right:4px;"></div>
             </div>
 
             <!-- Player Controller Card -->
@@ -482,12 +712,22 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
                         <span class="time-text" id="timeTotal">00:00</span>
                     </div>
 
-                    <button type="button" id="pauseBtn" class="btn-action" onclick="sendAction('toggle_pause')">⏸ Pause</button>
+                    <div style="display:flex; gap:6px;">
+                        <button type="button" class="btn-sec" style="flex:1;" onclick="sendAction('prev_track')">⏮ Prev</button>
+                        <button type="button" id="pauseBtn" class="btn-action" style="flex:2;" onclick="sendAction('toggle_pause')">⏸ Pause</button>
+                        <button type="button" class="btn-sec" style="flex:1;" onclick="sendAction('next_track')">⏭ Next</button>
+                    </div>
 
                     <div class="volume-row">
                         <span style="font-size:12px; color:var(--text-muted);">🔊</span>
                         <input type="range" class="vol-slider" id="volumeSlider" min="0" max="100" value="100" oninput="setVolume(this.value)">
                         <span style="font-size:11px; color:var(--text-muted); min-width: 35px;" id="volText">100%</span>
+                    </div>
+
+                    <!-- Queue List -->
+                    <div>
+                        <div class="panel-title" style="margin-bottom: 6px; font-size:10px;">Current Playlist Queue</div>
+                        <div id="queueList" style="display:flex; flex-direction:column; gap:4px; max-height:120px; overflow-y:auto;"></div>
                     </div>
                 </div>
             </div>
@@ -560,10 +800,23 @@ document.getElementById('authPasscode').addEventListener('keypress', (e) => { if
 </div>
 
 <script>
-const CSRF_TOKEN = "<?php echo $csrfToken; ?>";
-let statusAbortController = null;
+const CSRF_TOKEN = "<?php echo $_SESSION['csrf_token'] ?? ''; ?>";
+let isCheckingStatus = false;
 let statusTimer = null;
-let lastCheckTime = Date.now();
+
+// SECURITY UTILITY: ESCAPE HTML ENTITIES
+function escapeHtml(str) {
+    if (typeof str !== 'string') return '';
+    return str.replace(/[&<>"']/g, function(c) {
+        return {
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;'
+        }[c];
+    });
+}
 
 function formatTime(secs) {
     if (!secs || isNaN(secs) || secs < 0) return "00:00";
@@ -573,41 +826,55 @@ function formatTime(secs) {
     return (m < 10 ? "0" + m : m) + ":" + (s < 10 ? "0" + s : s);
 }
 
+// Fetch helper bọc AbortController chống treo UI
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(id);
+        return response;
+    } catch (err) {
+        clearTimeout(id);
+        throw err;
+    }
+}
+
 async function sendAction(actionName, extraData = {}) {
     const formData = new FormData();
     formData.append('action', actionName);
-    formData.append('url', document.getElementById('ytUrl').value);
-    formData.append('sudo_pass', document.getElementById('sudoPass').value);
-    formData.append('cmd', document.getElementById('shellCmd').value);
-    formData.append('cookie_content', document.getElementById('cookieContent').value);
+
+    let targetUrl = '';
+    if (extraData && typeof extraData.url === 'string' && extraData.url.trim() !== '') {
+        targetUrl = extraData.url.trim();
+    } else {
+        const inputElem = document.getElementById('ytUrl');
+        if (inputElem) targetUrl = inputElem.value.trim();
+    }
+
+    formData.append('url', targetUrl);
+    formData.append('sudo_pass', document.getElementById('sudoPass')?.value || '');
+    formData.append('cmd', document.getElementById('shellCmd')?.value || '');
+    formData.append('cookie_content', document.getElementById('cookieContent')?.value || '');
 
     for (let key in extraData) {
-        formData.append(key, extraData[key]);
+        if (key !== 'url') {
+            formData.append(key, extraData[key]);
+        }
     }
 
     const alertBox = document.getElementById('alertBox');
     const termOutput = document.getElementById('termOutput');
 
-    // Hủy request poll status đang chạy dở để ưu tiên gửi action ngay
-    if (statusAbortController) {
-        statusAbortController.abort();
-        statusAbortController = null;
-    }
-
-    const actionController = new AbortController();
-    const actionTimeout = setTimeout(() => actionController.abort(), 8000);
-
     try {
-        const res = await fetch(window.location.href, {
+        const res = await fetchWithTimeout(window.location.href, {
             method: 'POST',
             headers: {
                 'X-Requested-With': 'XMLHttpRequest',
                 'X-CSRF-Token': CSRF_TOKEN
             },
-            body: formData,
-            signal: actionController.signal
-        });
-        clearTimeout(actionTimeout);
+            body: formData
+        }, 8000);
 
         if (res.status === 401 || res.status === 403) {
             window.location.reload();
@@ -617,22 +884,112 @@ async function sendAction(actionName, extraData = {}) {
         const data = await res.json();
 
         if (data.status === 'terminal') {
-            termOutput.style.display = 'block';
-            termOutput.textContent = data.output || 'Command executed.';
+            if (termOutput) {
+                termOutput.style.display = 'block';
+                termOutput.textContent = data.output || 'Command executed.';
+            }
         } else if (data.message && actionName !== 'set_volume') {
-            alertBox.style.display = 'block';
-            alertBox.className = 'alert ' + (data.status === 'success' ? 'success' : 'error');
-            alertBox.textContent = data.message;
+            if (alertBox) {
+                alertBox.style.display = 'block';
+                alertBox.className = 'alert ' + (data.status === 'success' ? 'success' : 'error');
+                alertBox.textContent = data.message;
+            }
         }
 
         triggerStatusCheckNow();
     } catch (err) {
-        clearTimeout(actionTimeout);
-        alertBox.style.display = 'block';
-        alertBox.className = 'alert error';
-        alertBox.textContent = err.name === 'AbortError' ? 'Action Timeout!' : 'Server connection error!';
-        triggerStatusCheckNow();
+        if (alertBox) {
+            alertBox.style.display = 'block';
+            alertBox.className = 'alert error';
+            alertBox.textContent = err.name === 'AbortError' ? 'Request Timeout!' : 'Server connection error or invalid CSRF token!';
+        }
     }
+}
+
+// XSS-SAFE YT & YT MUSIC SEARCH (Xài data-url & Event Delegation)
+async function searchYoutube() {
+    const query = document.getElementById('ytSearchInput').value.trim();
+    const limit = document.getElementById('ytSearchLimit').value;
+    const provider = document.getElementById('ytSearchProvider').value;
+    if (!query) return;
+
+    const providerName = provider === 'ytmsearch' ? 'YouTube Music' : 'YouTube';
+    const resultsBox = document.getElementById('searchResults');
+    resultsBox.innerHTML = `<div style="font-size:11px; color:var(--text-muted);">Searching top ${limit} ${providerName} results...</div>`;
+
+    const formData = new FormData();
+    formData.append('action', 'search_yt');
+    formData.append('query', query);
+    formData.append('limit', limit);
+    formData.append('provider', provider);
+
+    try {
+        const timeoutMs = limit > 15 ? 20000 : 12000;
+        const res = await fetchWithTimeout(window.location.href, {
+            method: 'POST',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRF-Token': CSRF_TOKEN },
+            body: formData
+        }, timeoutMs);
+
+        const data = await res.json();
+
+        if (data.status === 'success' && data.results) {
+            resultsBox.innerHTML = `<div style="font-size:10px; color:var(--accent-green); margin-bottom:4px;">✔ Found ${data.results.length} ${providerName} results</div>`;
+            data.results.forEach(item => {
+                const div = document.createElement('div');
+                div.className = 'search-item';
+
+                const safeTitle = escapeHtml(item.title);
+                const safeUploader = escapeHtml(item.uploader);
+                const safeThumb = escapeHtml(item.thumb);
+
+                div.innerHTML = `
+                    <img src="${safeThumb}" class="search-thumb" alt="thumb" onerror="this.style.display='none'">
+                    <div class="search-info">
+                        <div class="search-title" title="${safeTitle}">${safeTitle}</div>
+                        <div class="search-sub">${safeUploader} • ${formatTime(item.duration)}</div>
+                    </div>
+                    <div class="search-btns">
+                        <button type="button" class="btn-play btn-sm btn-play-direct">▶</button>
+                        <button type="button" class="btn-enqueue btn-sm btn-enqueue-direct">+</button>
+                    </div>
+                `;
+
+                // Safe event binding sử dụng dataset
+                const playBtn = div.querySelector('.btn-play-direct');
+                const enqueueBtn = div.querySelector('.btn-enqueue-direct');
+
+                playBtn.dataset.url = item.url;
+                enqueueBtn.dataset.url = item.url;
+
+                playBtn.addEventListener('click', function() {
+                    playDirect(this.dataset.url);
+                });
+
+                enqueueBtn.addEventListener('click', function() {
+                    enqueueDirect(this.dataset.url);
+                });
+
+                resultsBox.appendChild(div);
+            });
+        } else {
+            resultsBox.innerHTML = `<div style="font-size:11px; color:var(--accent-red);">${escapeHtml(data.message || 'No results found!')}</div>`;
+        }
+    } catch(e) {
+        resultsBox.innerHTML = '<div style="font-size:11px; color:var(--accent-red);">Search failed or timed out!</div>';
+    }
+}
+
+function playDirect(url) {
+    if (!url) return;
+    const inputElem = document.getElementById('ytUrl');
+    if (inputElem) inputElem.value = url;
+    sendAction('play', { url: url });
+}
+
+function enqueueDirect(url) {
+    if (!url) return;
+    sendAction('enqueue', { url: url });
 }
 
 function setVolume(val) {
@@ -649,52 +1006,42 @@ async function uploadCookieFile() {
     formData.append('cookie_file', fileInput.files[0]);
 
     try {
-        const res = await fetch(window.location.href, {
+        const res = await fetchWithTimeout(window.location.href, {
             method: 'POST',
             headers: {
                 'X-Requested-With': 'XMLHttpRequest',
                 'X-CSRF-Token': CSRF_TOKEN
             },
             body: formData
-        });
+        }, 5000);
         const data = await res.json();
         alert(data.message);
         triggerStatusCheckNow();
     } catch(e) {
-        alert("Upload failed.");
+        alert("Upload failed or timed out.");
     }
 }
 
 document.getElementById('ytUrl').addEventListener('keypress', (e) => { if (e.key === 'Enter') sendAction('play'); });
 document.getElementById('shellCmd').addEventListener('keypress', (e) => { if (e.key === 'Enter') sendAction('run_cmd'); });
+document.getElementById('ytSearchInput').addEventListener('keypress', (e) => { if (e.key === 'Enter') searchYoutube(); });
 
 async function checkStatus() {
-    lastCheckTime = Date.now();
-
-    // Nếu đang có request poll cũ chưa trả về -> HỦY BỎ REQUEST CŨ NGAY
-    if (statusAbortController) {
-        statusAbortController.abort();
-    }
-
-    statusAbortController = new AbortController();
-    const timeoutId = setTimeout(() => {
-        if (statusAbortController) statusAbortController.abort();
-    }, 2500); // Poll status timeout 2.5s ép hủy
+    if (isCheckingStatus) return;
+    isCheckingStatus = true;
 
     try {
         const formData = new FormData();
         formData.append('action', 'get_status');
 
-        const res = await fetch(window.location.href, {
+        const res = await fetchWithTimeout(window.location.href, {
             method: 'POST',
             headers: {
                 'X-Requested-With': 'XMLHttpRequest',
                 'X-CSRF-Token': CSRF_TOKEN
             },
-            body: formData,
-            signal: statusAbortController.signal
-        });
-        clearTimeout(timeoutId);
+            body: formData
+        }, 3000);
 
         if (res.status === 401 || res.status === 403) {
             window.location.reload();
@@ -731,6 +1078,25 @@ async function checkStatus() {
                 } else {
                     document.getElementById('progressFill').style.width = '0%';
                 }
+
+                // Render Queue Playlist Safe XSS
+                const queueBox = document.getElementById('queueList');
+                if (data.media.playlist && Array.isArray(data.media.playlist)) {
+                    queueBox.innerHTML = '';
+                    data.media.playlist.forEach((item, idx) => {
+                        const qDiv = document.createElement('div');
+                        qDiv.className = 'queue-item' + (item.current ? ' active' : '');
+                        const rawTitle = item.title || item.filename || `Track #${idx + 1}`;
+                        const prefix = item.current ? '▶ ' : '';
+
+                        // Set text via textContent để chống XSS
+                        const span = document.createElement('span');
+                        span.textContent = `${prefix}${idx + 1}. ${rawTitle}`;
+                        qDiv.appendChild(span);
+
+                        queueBox.appendChild(qDiv);
+                    });
+                }
             }
         } else {
             procSection.style.display = 'none';
@@ -751,9 +1117,9 @@ async function checkStatus() {
             }
         }
     } catch(e) {
-        // Bỏ qua AbortError khi sleep/switch tab
+        // Suppress errors during sleep
     } finally {
-        statusAbortController = null;
+        isCheckingStatus = false;
         scheduleNextStatusCheck(1500);
     }
 }
@@ -765,24 +1131,12 @@ function scheduleNextStatusCheck(delay = 1500) {
 
 function triggerStatusCheckNow() {
     if (statusTimer) clearTimeout(statusTimer);
-    if (statusAbortController) {
-        statusAbortController.abort();
-        statusAbortController = null;
-    }
+    isCheckingStatus = false;
     checkStatus();
 }
 
-// WATCHDOG TIMER: Tự động hồi sinh nếu sau 4.5s mà không thấy poll chạy (Chống đơ khi wake up)
-setInterval(() => {
-    if (Date.now() - lastCheckTime > 4500) {
-        triggerStatusCheckNow();
-    }
-}, 2000);
+scheduleNextStatusCheck(500);
 
-// Bắt đầu chạy
-scheduleNextStatusCheck(300);
-
-// Khi bật lại màn hình hoặc active lại tab -> Khôi phục tức thì
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
         triggerStatusCheckNow();
@@ -793,9 +1147,11 @@ window.addEventListener('focus', () => {
     triggerStatusCheckNow();
 });
 </script>
+
+<!-- Service Worker Registration for PWA -->
 <script>
 if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(err => console.log('SW error:', err));
+    navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(err => console.log('SW error:', err));
 }
 </script>
 <?php endif; ?>
