@@ -838,7 +838,7 @@ function escapeHtml(str) {
 }
 
 function formatTime(secs) {
-    if (!secs || isNaN(secs) || secs <= 0) return "YTM Track";
+    if (!secs || isNaN(secs) || secs <= 0) return "00:00";
     const totalSecs = Math.floor(parseFloat(secs));
     const m = Math.floor(totalSecs / 60);
     const s = totalSecs % 60;
