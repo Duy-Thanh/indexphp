@@ -1,15 +1,52 @@
 {
   "name": "MPV Control Center",
   "short_name": "MPV Control",
-  "start_url": "./",
+  "description": "Remote Media Controller for MPV & YouTube Music",
+  "start_url": "./index.php",
+  "scope": "./",
   "display": "standalone",
+  "orientation": "portrait-primary",
   "background_color": "#0a0b0e",
   "theme_color": "#0a0b0e",
+  "lang": "en",
+  "categories": ["utilities", "music"],
   "icons": [
     {
-      "src": "https://cdn-icons-png.flaticon.com/512/1384/1384060.png",
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icon-512.png",
       "sizes": "512x512",
-      "type": "image/png"
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "share_target": {
+    "action": "./index.php",
+    "method": "GET",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url"
+    }
+  },
+  "shortcuts": [
+    {
+      "name": "Quick Search",
+      "short_name": "Search",
+      "description": "Search YouTube Music instantly",
+      "url": "./index.php?action=focus_search",
+      "icons": [{ "src": "./icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Stop Playback",
+      "short_name": "Stop",
+      "description": "Kill MPV Process",
+      "url": "./index.php?action=stop_playback",
+      "icons": [{ "src": "./icon-192.png", "sizes": "192x192" }]
     }
   ]
 }

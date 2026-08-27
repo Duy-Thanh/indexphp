@@ -1154,6 +1154,46 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(err => console.log('SW error:', err));
 }
 </script>
+
+<script>
+// =========================================================================
+// PWA SHARE TARGET & SHORTCUTS HANDLER
+// =========================================================================
+document.addEventListener('DOMContentLoaded', () => {
+    const urlParams = new URLSearchParams(window.location.search);
+
+    // 1. Xử lý khi nhận Share Target từ App YouTube / Browser (Nhận tham số ?url=... hoặc ?text=...)
+    const sharedUrl = urlParams.get('url') || urlParams.get('text');
+    if (sharedUrl) {
+        // Tách lấy URL YouTube nếu chuỗi Share chứa cả Title
+        const matched = sharedUrl.match(/(https?:\/\/[^\s]+)/g);
+        const finalTargetUrl = matched ? matched[0] : sharedUrl;
+
+        const ytInput = document.getElementById('ytUrl');
+        if (ytInput) {
+            ytInput.value = finalTargetUrl;
+            // Tự động Play luôn khi nhận link từ nút Share!
+            setTimeout(() => {
+                sendAction('play', { url: finalTargetUrl });
+            }, 300);
+        }
+
+        // Dọn sạch URL param để tránh lặp lại khi reload
+        window.history.replaceState({}, document.title, window.location.pathname);
+    }
+
+    // 2. Xử lý App Shortcuts (Nhấn giữ icon ngoài Màn hình chính)
+    const actionParam = urlParams.get('action');
+    if (actionParam === 'focus_search') {
+        const searchInput = document.getElementById('ytSearchInput');
+        if (searchInput) searchInput.focus();
+        window.history.replaceState({}, document.title, window.location.pathname);
+    } else if (actionParam === 'stop_playback') {
+        sendAction('stop');
+        window.history.replaceState({}, document.title, window.location.pathname);
+    }
+});
+</script>
 <?php endif; ?>
 
 </body>
